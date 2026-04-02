@@ -1,0 +1,39 @@
+# C++ / CMake
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.pdb
+*.ilk
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# IDE
+.vscode/
+.idea/
+*.user
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+.venv/
+venv/
+
+# Pybind11 Python module artifacts in python/
+python/matching_engine*.so
+python/matching_engine*.pyd
+
+# Test / coverage
+*.coverage
+.coverage
+htmlcov/
+.pytest_cache/

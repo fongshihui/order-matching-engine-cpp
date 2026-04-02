@@ -17,6 +17,7 @@ Makefile
 # IDE
 .vscode/
 .idea/
+.cache/
 *.user
 
 # Python
@@ -28,9 +29,9 @@ __pycache__/
 .venv/
 venv/
 
-# Pybind11 Python module artifacts in python/
-python/matching_engine*.so
-python/matching_engine*.pyd
+# Generated server/client artifacts in python/
+python/matching_engine_server
+python/matching_engine_server.exe
 
 # Test / coverage
 *.coverage

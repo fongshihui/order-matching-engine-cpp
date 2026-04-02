@@ -10,6 +10,7 @@ std::vector<DepthLevel> MatchingEngine::depth(Side side) const {
     std::vector<DepthLevel> out;
     auto raw = book_.depth(side);
     out.reserve(raw.size());
+    // Convert the book's generic price/quantity pairs into the public API shape.
     for (const auto &p : raw) {
         out.push_back(DepthLevel{p.first, p.second});
     }
@@ -21,6 +22,8 @@ bool MatchingEngine::can_fully_fill(const NewOrder &order) const {
     Side opp = opposite(order.side);
     const auto &levels = book_.side_book(opp).levels();
 
+    // Walk the opposing side in match order and see whether enough visible liquidity
+    // exists to satisfy the full request immediately.
     if (order.side == Side::Buy) {
         for (const auto &kv : levels) {
             Price price = kv.first;
@@ -51,6 +54,7 @@ ExecutionReport MatchingEngine::handle_new(const NewOrder &no) {
     rep.order_id = no.order_id;
     rep.command = (no.type == OrderType::Limit) ? "NEW_LIMIT" : "NEW_MARKET";
 
+    // Basic validation happens before any book state is touched.
     if (no.qty == 0) {
         rep.rejected = true;
         rep.reject_reason = "INVALID";
@@ -100,8 +104,9 @@ ExecutionReport MatchingEngine::handle_new(const NewOrder &no) {
     Quantity remaining = no.qty;
     const bool is_market = (no.type == OrderType::Market);
 
+    // Repeatedly consume the current best opposing level until the order no longer
+    // crosses or there is no remaining liquidity to trade against.
     while (remaining > 0) {
-        // Best opposing price
         std::optional<Price> best_opp = (no.side == Side::Buy) ? book_.best_ask() : book_.best_bid();
         if (!best_opp) break;
 
@@ -126,9 +131,10 @@ ExecutionReport MatchingEngine::handle_new(const NewOrder &no) {
             continue;
         }
 
+        // FIFO is preserved because the front order at the best price is always the
+        // next maker to trade.
         Order &resting = it_level->second.front();
 
-        // STP: reject when incoming would trade against same user.
         if (no.flags.stp && resting.user_id == no.user_id) {
             rep.rejected = true;
             rep.reject_reason = "STP_SELF_TRADE_PREVENTION";
@@ -138,6 +144,8 @@ ExecutionReport MatchingEngine::handle_new(const NewOrder &no) {
 
         Quantity traded = std::min(remaining, resting.qty);
 
+        // Execution reports record each maker/taker match independently so callers
+        // can reconstruct how the order was filled.
         Fill fill;
         fill.maker_order_id = resting.order_id;
         fill.maker_user_id = resting.user_id;
@@ -152,20 +160,19 @@ ExecutionReport MatchingEngine::handle_new(const NewOrder &no) {
         resting.qty -= traded;
 
         if (resting.qty == 0) {
-            // Remove fully filled resting order from the book.
             book_.remove_order(resting.order_id);
         }
     }
 
-    // Market and IOC orders never rest.
+    // Market and IOC orders never rest on the book, so any leftover is canceled.
     if (is_market || no.flags.ioc) {
         if (remaining > 0) {
-            rep.canceled = true; // remainder canceled
+            rep.canceled = true;
         }
         return rep;
     }
 
-    // Rest remaining quantity as a limit order on the book.
+    // A regular limit order leaves its unfilled remainder on the book at its limit price.
     if (remaining > 0 && no.type == OrderType::Limit) {
         Order resting{no.order_id, no.user_id, no.side, *no.price, remaining};
         book_.add_order(resting);
@@ -211,13 +218,13 @@ ExecutionReport MatchingEngine::handle_modify(const ModifyOrder &mod) {
     Quantity new_qty = mod.new_qty.value_or(existing.qty);
 
     if (new_qty == 0) {
-        // Treat as a cancel.
         book_.remove_order(mod.order_id);
         rep.canceled = true;
         return rep;
     }
 
-    // Remove old order from book before re-inserting at new price/qty.
+    // Modify is implemented as cancel-and-reinsert so the order is re-evaluated with
+    // the same matching rules as a fresh incoming limit order.
     book_.remove_order(mod.order_id);
 
     NewOrder no;
@@ -231,7 +238,6 @@ ExecutionReport MatchingEngine::handle_modify(const ModifyOrder &mod) {
 
     ExecutionReport new_rep = handle_new(no);
     if (new_rep.rejected) {
-        // Revert to original order if re-pricing failed.
         Order revert{existing.order_id, existing.user_id, existing.side, existing.price, existing.qty};
         book_.add_order(revert);
     }

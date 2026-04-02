@@ -5,12 +5,15 @@
 namespace engine {
 
 void SideBook::add(const Order &order) {
+    // Orders at the same price are appended so time priority is preserved within
+    // that price level.
     levels_[order.price].push_back(order);
 }
 
 std::optional<Price> SideBook::best_price() const {
     if (levels_.empty()) return std::nullopt;
     if (side_ == Side::Buy) {
+        // reverse begin
         return levels_.rbegin()->first; // highest bid
     }
     return levels_.begin()->first; // lowest ask
@@ -21,12 +24,16 @@ std::vector<std::pair<Price, Quantity>> SideBook::depth() const {
     out.reserve(levels_.size());
 
     if (side_ == Side::Buy) {
+        // Bids are reported from highest price to lowest price because that is the
+        // economically best-to-worst order for buyers.
         for (auto it = levels_.rbegin(); it != levels_.rend(); ++it) {
             Quantity sum = 0;
             for (const auto &o : it->second) sum += o.qty;
             out.emplace_back(it->first, sum);
         }
     } else {
+        // Asks are reported from lowest price to highest price because lower sell
+        // prices are better for incoming buyers.
         for (const auto &kv : levels_) {
             Quantity sum = 0;
             for (const auto &o : kv.second) sum += o.qty;
@@ -50,6 +57,8 @@ void OrderBook::clear() {
 
 void OrderBook::add_order(const Order &order) {
     side_book(order.side).add(order);
+    // Keep a lightweight id index so cancel/modify can find an order without
+    // scanning the whole book.
     id_index_[order.order_id] = {order.side, order.price};
     update_best();
 }
@@ -74,6 +83,7 @@ std::optional<Order> OrderBook::remove_order(OrderId id) {
             Order removed = *it;
             queue.erase(it);
             if (queue.empty()) {
+                // Drop empty price levels so best-price queries and depth stay clean.
                 sb.levels().erase(it_level);
             }
             id_index_.erase(it_idx);
@@ -94,6 +104,8 @@ std::optional<Order> OrderBook::find_order(OrderId id) const {
 
     Side side = it_idx->second.first;
     Price price = it_idx->second.second;
+    // The id index gets us to the correct side and price level quickly, then we
+    // search only within that FIFO queue.
     const auto &sb = side == Side::Buy ? bids_ : asks_;
     const auto &levels = sb.levels();
     auto it_level = levels.find(price);
@@ -118,6 +130,7 @@ std::optional<std::pair<Side, Price>> OrderBook::locate(OrderId id) const {
 }
 
 void OrderBook::update_best() {
+    // Cache top-of-book values so matching logic can check best bid/ask in O(1).
     best_bid_ = bids_.best_price();
     best_ask_ = asks_.best_price();
 }

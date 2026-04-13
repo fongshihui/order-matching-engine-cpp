@@ -1,6 +1,6 @@
 # Order-matching engine in C++ with a Python client
 
-This repository provides a small, readable limit-order-book matching engine written in modern C++ (C++17) with a Python client. Orders originate from Python dictionaries, are sent to a standalone C++ engine process, are matched with **price–time priority**, and results are returned back to Python as execution-report dictionaries.
+This repository provides a small, readable limit-order-book matching engine written in modern C++ (C++17) with a Python client. Orders originate from Python dictionaries, are encoded into **Protocol Buffers** messages, are sent over a localhost TCP connection to a standalone C++ engine process, are matched with **price–time priority**, and results are returned back to Python as execution-report dictionaries.
 
 ## Features
 
@@ -13,14 +13,16 @@ This repository provides a small, readable limit-order-book matching engine writ
   - `STP` – self-trade prevention; rejects the incoming order when it would trade against the same user.
 - Market orders never rest on the book.
 - Book maintains cached **best bid/ask** and exposes aggregated depth.
-- Thin Python client over a standalone C++ server process:
+- Thin Python client over a standalone C++ TCP server with a protobuf contract:
   - `MatchingEngine.process(command_dict) -> execution_report_dict`.
   - `MatchingEngine.best_bid()`, `MatchingEngine.best_ask()`.
   - `MatchingEngine.depth(side) -> list[{"price", "qty"}]`.
 
 ## Repository layout
 
-- `CMakeLists.txt` – builds the C++ static library and the `matching_engine_server` executable, output into `python/`.
+- `CMakeLists.txt` – builds the C++ static library, generates protobuf bindings for C++ and Python, and builds the `matching_engine_server` executable into `python/`.
+- `proto/`
+  - `matching_engine.proto` – schema for request/response envelopes exchanged between Python and C++.
 - `include/engine/`
   - `order.hpp` – core types: `Side`, `OrderType`, `Flags`, `Order`, and command structs (`NewOrder`, `CancelOrder`, `ModifyOrder`, `Command`).
   - `events.hpp` – `Fill` and `ExecutionReport` structures.
@@ -30,9 +32,9 @@ This repository provides a small, readable limit-order-book matching engine writ
   - `order.cpp`, `events.cpp` – thin translation units for the header-only helpers.
   - `book.cpp` – implementation of `SideBook` and `OrderBook`.
   - `matching_engine.cpp` – matching logic (price–time priority, flags, STP).
-  - `server_main.cpp` – line-oriented C++ server process that wraps `MatchingEngine`.
+  - `server_main.cpp` – protobuf-based C++ TCP server that wraps `MatchingEngine`.
 - `python/`
-  - `matching_engine.py` – Python client that starts the C++ server process and exposes the same `MatchingEngine` API.
+  - `matching_engine.py` – Python client that starts or connects to the C++ TCP server, imports the generated `matching_engine_pb2.py` module, and exposes the same `MatchingEngine` API.
   - `orders_demo.py` – demo script: builds a sequence of orders, calls the C++ engine, prints execution reports, and shows final depth.
   - `test_engine.py` – pytest tests covering FIFO, partial fills, IOC/FOK, POST_ONLY, and STP.
 
@@ -57,7 +59,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-This produces a C++ server executable named `matching_engine_server` in the `python/` directory. The Python client in `python/matching_engine.py` launches that executable and translates between Python dictionaries and the server protocol.
+This produces a C++ server executable named `matching_engine_server` in the `python/` directory and generates protobuf artifacts under `build/generated/`. The Python client in `python/matching_engine.py` launches that executable on a localhost TCP port and imports the generated `build/generated/python/matching_engine_pb2.py` module to serialize requests through the schema in `proto/matching_engine.proto`.
 
 ## Python API
 
@@ -65,6 +67,8 @@ This produces a C++ server executable named `matching_engine_server` in the `pyt
 import matching_engine
 
 eng = matching_engine.MatchingEngine()
+# or connect to an already-running server:
+# eng = matching_engine.MatchingEngine(port=50051, start_server=False)
 
 cmd = {
     "command": "NEW_LIMIT",         # or NEW_MARKET / CANCEL / MODIFY

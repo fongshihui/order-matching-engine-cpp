@@ -32,6 +32,7 @@ venv/
 # Generated server/client artifacts in python/
 python/matching_engine_server
 python/matching_engine_server.exe
+python/matching_engine_server.dSYM/
 
 # Test / coverage
 *.coverage

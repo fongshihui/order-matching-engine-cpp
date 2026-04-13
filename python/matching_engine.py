@@ -1,32 +1,17 @@
+import struct
 import subprocess
+import socket
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
-
 
 Command = dict[str, Any]
 ExecutionReport = dict[str, Any]
 
 THIS_DIR = Path(__file__).resolve().parent
 ROOT_DIR = THIS_DIR.parent
-
-
-def _hex_decode(value: str) -> str:
-    if not value:
-        return ""
-    return bytes.fromhex(value).decode("utf-8")
-
-
-def _parse_fields(line: str) -> tuple[str, dict[str, str]]:
-    parts = line.rstrip("\n").split("\t")
-    prefix = parts[0]
-    fields: dict[str, str] = {}
-    for token in parts[1:]:
-        if "=" not in token:
-            raise RuntimeError(f"invalid server response field: {token}")
-        key, value = token.split("=", 1)
-        fields[key] = value
-    return prefix, fields
 
 
 def _candidate_server_paths() -> list[Path]:
@@ -41,6 +26,13 @@ def _candidate_server_paths() -> list[Path]:
     ]
 
 
+def _candidate_proto_modules() -> list[Path]:
+    return [
+        build_dir / "generated" / "python"
+        for build_dir in sorted(ROOT_DIR.glob("build*"))
+    ]
+
+
 def _find_server_binary() -> Path:
     for path in _candidate_server_paths():
         if path.exists():
@@ -50,124 +42,153 @@ def _find_server_binary() -> Path:
     )
 
 
+def _load_proto_bindings() -> Any:
+    # Use the generated Python protobuf module directly now that the local
+    # protobuf runtime has been upgraded to a compatible version.
+    for directory in _candidate_proto_modules():
+        module_path = directory / "matching_engine_pb2.py"
+        if not module_path.exists():
+            continue
+        if str(directory) not in sys.path:
+            sys.path.insert(0, str(directory))
+        import matching_engine_pb2
+
+        return matching_engine_pb2
+    raise FileNotFoundError(
+        "matching_engine_pb2.py not found. Build the project first so protoc can generate it."
+    )
+
+
+def _read_exact_socket(sock: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = sock.recv(size - len(chunks))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _reserve_local_port(host: str) -> tuple[int, socket.socket]:
+    # Reserve an ephemeral port before spawning the server so the child can be
+    # launched with a concrete port number and the parent can connect to it.
+    reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    reserved.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    reserved.bind((host, 0))
+    return int(reserved.getsockname()[1]), reserved
+
+
+def _connect_with_retry(host: str, port: int, timeout_s: float = 5.0) -> socket.socket:
+    deadline = time.monotonic() + timeout_s
+    last_error: OSError | None = None
+    while time.monotonic() < deadline:
+        try:
+            connection = socket.create_connection((host, port), timeout=0.5)
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return connection
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise RuntimeError(
+        f"failed to connect to matching engine server on {host}:{port}: {last_error}"
+    )
+
+
 class MatchingEngine:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+        start_server: bool = True,
+    ) -> None:
         self._lock = threading.Lock()
         self._closed = False
-        self._process = subprocess.Popen(
-            [str(_find_server_binary())],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=ROOT_DIR,
-        )
+        self._proto = _load_proto_bindings()
+        self._host = host
+        self._owns_server = start_server
+        self._process: subprocess.Popen[bytes] | None = None
+
+        reserved_socket: socket.socket | None = None
+        if port is None:
+            if not start_server:
+                raise ValueError("port must be provided when start_server is False")
+            port, reserved_socket = _reserve_local_port(host)
+        self._port = port
+
+        try:
+            if start_server:
+                # Default mode: Python owns the C++ TCP server lifecycle and
+                # connects to it over localhost once the process is listening.
+                self._process = subprocess.Popen(
+                    [str(_find_server_binary()), "--port", str(self._port)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    cwd=ROOT_DIR,
+                )
+            if reserved_socket is not None:
+                reserved_socket.close()
+                reserved_socket = None
+            self._socket = _connect_with_retry(self._host, self._port)
+        except Exception:
+            if reserved_socket is not None:
+                reserved_socket.close()
+            if self._process is not None:
+                self._process.kill()
+                self._process.wait(timeout=1)
+            raise
 
     def process(self, command: Command) -> ExecutionReport:
-        flags = dict(command.get("flags", {}) or {})
-        fields = [
-            "PROCESS",
-            f"command={command['command']}",
-            f"order_id={command['order_id']}",
-        ]
-        if "user_id" in command:
-            fields.append(f"user_id={command['user_id']}")
-        if "side" in command:
-            fields.append(f"side={command['side']}")
-        if "type" in command:
-            fields.append(f"type={command['type']}")
-        if "price" in command and command["price"] is not None:
-            fields.append(f"price={command['price']}")
-        if "qty" in command and command["qty"] is not None:
-            fields.append(f"qty={command['qty']}")
-        fields.extend(
-            [
-                f"ioc={1 if flags.get('ioc', False) else 0}",
-                f"fok={1 if flags.get('fok', False) else 0}",
-                f"post_only={1 if flags.get('post_only', False) else 0}",
-                f"stp={1 if flags.get('stp', False) else 0}",
-            ]
-        )
-        with self._lock:
-            self._send_line("\t".join(fields))
-            prefix, report_fields = self._read_response_line()
-            if prefix != "REPORT":
-                raise RuntimeError(f"unexpected server response: {prefix}")
-
-            fills: list[dict[str, Any]] = []
-            while True:
-                line = self._read_line()
-                fill_prefix, fill_fields = _parse_fields(line)
-                if fill_prefix == "END":
-                    break
-                if fill_prefix != "FILL":
-                    raise RuntimeError(f"unexpected report payload: {fill_prefix}")
-                fills.append(
-                    {
-                        "maker_order_id": int(fill_fields["maker_order_id"]),
-                        "maker_user_id": int(fill_fields["maker_user_id"]),
-                        "taker_order_id": int(fill_fields["taker_order_id"]),
-                        "taker_user_id": int(fill_fields["taker_user_id"]),
-                        "side": fill_fields["side"],
-                        "price": int(fill_fields["price"]),
-                        "qty": int(fill_fields["qty"]),
-                    }
-                )
-
-            return {
-                "command": report_fields["command"],
-                "order_id": int(report_fields["order_id"]),
-                "rejected": report_fields["rejected"] == "1",
-                "reject_reason": _hex_decode(report_fields["reject_reason_hex"]),
-                "reject_message": _hex_decode(report_fields["reject_message_hex"]),
-                "canceled": report_fields["canceled"] == "1",
-                "fills": fills,
-                "filled_qty": int(report_fields["filled_qty"]),
-            }
+        request = self._proto.RequestEnvelope()
+        request.process.CopyFrom(self._command_to_proto(command))
+        response = self._round_trip(request)
+        if response.WhichOneof("payload") != "report":
+            raise RuntimeError(
+                f"unexpected server response: {response.WhichOneof('payload')}"
+            )
+        return self._report_to_dict(response.report)
 
     def best_bid(self) -> int | None:
-        return self._request_optional_value("BEST_BID")
+        return self._request_optional_price("best_bid")
 
     def best_ask(self) -> int | None:
-        return self._request_optional_value("BEST_ASK")
+        return self._request_optional_price("best_ask")
 
     def depth(self, side: str) -> list[dict[str, int]]:
-        with self._lock:
-            self._send_line(f"DEPTH\tside={side}")
-            prefix, _ = self._read_response_line()
-            if prefix != "DEPTH":
-                raise RuntimeError(f"unexpected server response: {prefix}")
-
-            levels: list[dict[str, int]] = []
-            while True:
-                line = self._read_line()
-                level_prefix, fields = _parse_fields(line)
-                if level_prefix == "END":
-                    return levels
-                if level_prefix != "LEVEL":
-                    raise RuntimeError(f"unexpected depth payload: {level_prefix}")
-                levels.append(
-                    {
-                        "price": int(fields["price"]),
-                        "qty": int(fields["qty"]),
-                    }
-                )
+        request = self._proto.RequestEnvelope()
+        request.depth.side = self._side_to_proto(side)
+        response = self._round_trip(request)
+        if response.WhichOneof("payload") != "depth":
+            raise RuntimeError(
+                f"unexpected server response: {response.WhichOneof('payload')}"
+            )
+        # Depth returns aggregated price levels rather than individual orders.
+        return [
+            {"price": level.price, "qty": level.qty} for level in response.depth.levels
+        ]
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
-            if self._process.stdin is not None and self._process.poll() is None:
+            if self._owns_server:
+                # If this client started the server, ask it to stop cleanly so
+                # the listening socket is released before falling back to kill().
                 try:
-                    self._send_line("QUIT")
-                    line = self._read_line()
-                    prefix, _ = _parse_fields(line)
-                    if prefix != "BYE":
-                        raise RuntimeError(f"unexpected server response: {prefix}")
+                    request = self._proto.RequestEnvelope()
+                    request.quit.SetInParent()
+                    response = self._round_trip_locked(request)
+                    if response.WhichOneof("payload") != "quit":
+                        raise RuntimeError(
+                            f"unexpected server response: {response.WhichOneof('payload')}"
+                        )
                 except Exception:
-                    self._process.kill()
+                    if self._process is not None and self._process.poll() is None:
+                        self._process.kill()
+            self._socket.close()
             self._closed = True
-            self._process.wait(timeout=1)
+            if self._process is not None:
+                self._process.wait(timeout=1)
 
     def __enter__(self) -> "MatchingEngine":
         return self
@@ -181,40 +202,156 @@ class MatchingEngine:
         except Exception:
             pass
 
-    def _request_optional_value(self, operation: str) -> int | None:
-        with self._lock:
-            self._send_line(operation)
-            prefix, fields = self._read_response_line()
-            if prefix != "VALUE":
-                raise RuntimeError(f"unexpected server response: {prefix}")
-            value = fields["value"]
-            return None if value == "NONE" else int(value)
+    def _request_optional_price(self, field_name: str) -> int | None:
+        request = self._proto.RequestEnvelope()
+        getattr(request, field_name).SetInParent()
+        response = self._round_trip(request)
+        if response.WhichOneof("payload") != field_name:
+            raise RuntimeError(
+                f"unexpected server response: {response.WhichOneof('payload')}"
+            )
+        message = getattr(response, field_name)
+        return message.price if message.HasField("price") else None
 
-    def _send_line(self, line: str) -> None:
+    def _command_to_proto(self, command: Command) -> Any:
+        process = self._proto.ProcessRequest()
+        command_name = str(command["command"]).upper()
+
+        # Convert the public Python dict API into the strongly typed protobuf
+        # request expected by the C++ server.
+        if command_name in {"NEW_LIMIT", "NEW_MARKET", "NEW"}:
+            message = process.new_order
+            message.order_id = int(command["order_id"])
+            message.user_id = int(command["user_id"])
+            message.side = self._side_to_proto(str(command["side"]))
+            if command_name == "NEW_LIMIT":
+                message.type = self._proto.ORDER_TYPE_LIMIT
+            elif command_name == "NEW_MARKET":
+                message.type = self._proto.ORDER_TYPE_MARKET
+            else:
+                message.type = self._order_type_to_proto(str(command["type"]))
+            if "price" in command and command["price"] is not None:
+                message.price = int(command["price"])
+            message.qty = int(command["qty"])
+            flags = dict(command.get("flags", {}) or {})
+            message.flags.ioc = bool(flags.get("ioc", False))
+            message.flags.fok = bool(flags.get("fok", False))
+            message.flags.post_only = bool(flags.get("post_only", False))
+            message.flags.stp = bool(flags.get("stp", False))
+            return process
+
+        if command_name == "CANCEL":
+            message = process.cancel
+            message.order_id = int(command["order_id"])
+            message.user_id = int(command["user_id"])
+            return process
+
+        if command_name == "MODIFY":
+            message = process.modify
+            message.order_id = int(command["order_id"])
+            if "price" in command and command["price"] is not None:
+                message.price = int(command["price"])
+            if "qty" in command and command["qty"] is not None:
+                message.qty = int(command["qty"])
+            return process
+
+        raise RuntimeError(f"unknown command: {command_name}")
+
+    def _report_to_dict(self, report: Any) -> ExecutionReport:
+        # Preserve the original Python-facing dictionary shape so the transport
+        # change does not force callers to rewrite their application code.
+        return {
+            "command": self._report_command_to_string(report.command),
+            "order_id": int(report.order_id),
+            "rejected": bool(report.rejected),
+            "reject_reason": report.reject_reason,
+            "reject_message": report.reject_message,
+            "canceled": bool(report.canceled),
+            "fills": [
+                {
+                    "maker_order_id": int(fill.maker_order_id),
+                    "maker_user_id": int(fill.maker_user_id),
+                    "taker_order_id": int(fill.taker_order_id),
+                    "taker_user_id": int(fill.taker_user_id),
+                    "side": self._side_to_string(fill.side),
+                    "price": int(fill.price),
+                    "qty": int(fill.qty),
+                }
+                for fill in report.fills
+            ],
+            "filled_qty": int(report.filled_qty),
+        }
+
+    def _round_trip(self, request: Any) -> Any:
+        with self._lock:
+            return self._round_trip_locked(request)
+
+    def _round_trip_locked(self, request: Any) -> Any:
         if self._closed:
             raise RuntimeError("matching engine client is closed")
-        if self._process.stdin is None:
-            raise RuntimeError("matching engine server stdin is unavailable")
-        self._process.stdin.write(f"{line}\n")
-        self._process.stdin.flush()
+        payload = request.SerializeToString()
+        frame = struct.pack(">I", len(payload)) + payload
+        # The TCP transport uses a 4-byte big-endian length prefix followed by
+        # the serialized protobuf payload, matching the C++ server framing.
+        self._socket.sendall(frame)
 
-    def _read_response_line(self) -> tuple[str, dict[str, str]]:
-        line = self._read_line()
-        prefix, fields = _parse_fields(line)
-        if prefix == "ERROR":
-            raise RuntimeError(_hex_decode(fields["message_hex"]))
-        return prefix, fields
+        response = self._read_response_locked()
+        if response.WhichOneof("payload") == "error":
+            raise RuntimeError(response.error.message)
+        return response
 
-    def _read_line(self) -> str:
-        if self._process.stdout is None:
-            raise RuntimeError("matching engine server stdout is unavailable")
-        line = self._process.stdout.readline()
-        if line:
-            return line
-        stderr_output = ""
-        if self._process.stderr is not None:
+    def _read_response_locked(self) -> Any:
+        size_bytes = _read_exact_socket(self._socket, 4)
+        if len(size_bytes) != 4:
+            raise RuntimeError(self._server_exit_message())
+        (size,) = struct.unpack(">I", size_bytes)
+        payload = _read_exact_socket(self._socket, size)
+        if len(payload) != size:
+            raise RuntimeError(self._server_exit_message())
+        response = self._proto.ResponseEnvelope()
+        if not response.ParseFromString(payload):
+            raise RuntimeError("failed to parse protobuf response")
+        return response
+
+    def _server_exit_message(self) -> str:
+        stderr_output = b""
+        if self._process is not None and self._process.stderr is not None:
             stderr_output = self._process.stderr.read().strip()
-        raise RuntimeError(
-            "matching engine server stopped unexpectedly"
-            + (f": {stderr_output}" if stderr_output else "")
-        )
+        message = "matching engine server stopped unexpectedly"
+        if stderr_output:
+            message += f": {stderr_output.decode('utf-8', errors='replace')}"
+        return message
+
+    def _side_to_proto(self, side: str) -> int:
+        side_upper = side.upper()
+        if side_upper == "BUY":
+            return self._proto.SIDE_BUY
+        if side_upper == "SELL":
+            return self._proto.SIDE_SELL
+        raise RuntimeError(f"invalid side: {side}")
+
+    def _order_type_to_proto(self, order_type: str) -> int:
+        type_upper = order_type.upper()
+        if type_upper == "LIMIT":
+            return self._proto.ORDER_TYPE_LIMIT
+        if type_upper == "MARKET":
+            return self._proto.ORDER_TYPE_MARKET
+        raise RuntimeError(f"invalid order type: {order_type}")
+
+    def _side_to_string(self, side: int) -> str:
+        if side == self._proto.SIDE_BUY:
+            return "BUY"
+        if side == self._proto.SIDE_SELL:
+            return "SELL"
+        raise RuntimeError(f"invalid protobuf side: {side}")
+
+    def _report_command_to_string(self, command: int) -> str:
+        if command == self._proto.REPORT_COMMAND_NEW_LIMIT:
+            return "NEW_LIMIT"
+        if command == self._proto.REPORT_COMMAND_NEW_MARKET:
+            return "NEW_MARKET"
+        if command == self._proto.REPORT_COMMAND_CANCEL:
+            return "CANCEL"
+        if command == self._proto.REPORT_COMMAND_MODIFY:
+            return "MODIFY"
+        return "UNKNOWN"

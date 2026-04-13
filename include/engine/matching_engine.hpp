@@ -4,6 +4,7 @@
 #include "engine/events.hpp"
 #include "engine/order.hpp"
 
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -21,13 +22,14 @@ public:
 
     ExecutionReport process(const Command &cmd);
 
-    std::optional<Price> best_bid() const { return book_.best_bid(); }
-    std::optional<Price> best_ask() const { return book_.best_ask(); }
+    std::optional<Price> best_bid() const;
+    std::optional<Price> best_ask() const;
 
     std::vector<DepthLevel> depth(Side side) const;
 
 private:
     OrderBook book_;
+    mutable std::mutex mutex_;
 
     ExecutionReport handle_new(const NewOrder &order);
     ExecutionReport handle_cancel(const CancelOrder &order);

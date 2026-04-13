@@ -1,41 +1,12 @@
-# C++ / CMake
-build/
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-*.o
-*.obj
-*.pdb
-*.ilk
-*.dll
-*.so
-*.dylib
-*.a
-*.lib
+# Claude Code
+.claude/
+.mcp.json
+.ttadk/
 
-# IDE
-.vscode/
-.idea/
+# Build
+build/
 .cache/
-*.user
 
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.python-version
-.venv/
-venv/
-
-# Generated server/client artifacts in python/
-python/matching_engine_server
-python/matching_engine_server.exe
-python/matching_engine_server.dSYM/
-
-# Test / coverage
-*.coverage
-.coverage
-htmlcov/
-.pytest_cache/

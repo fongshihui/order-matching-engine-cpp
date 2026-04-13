@@ -6,7 +6,18 @@ namespace engine {
 
 MatchingEngine::MatchingEngine() = default;
 
+std::optional<Price> MatchingEngine::best_bid() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return book_.best_bid();
+}
+
+std::optional<Price> MatchingEngine::best_ask() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return book_.best_ask();
+}
+
 std::vector<DepthLevel> MatchingEngine::depth(Side side) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<DepthLevel> out;
     auto raw = book_.depth(side);
     out.reserve(raw.size());
@@ -66,6 +77,14 @@ ExecutionReport MatchingEngine::handle_new(const NewOrder &no) {
         rep.rejected = true;
         rep.reject_reason = "INVALID";
         rep.reject_message = "Limit order requires a price";
+        return rep;
+    }
+
+    // Check for duplicate order ID to prevent corrupting the id_index_.
+    if (book_.find_order(no.order_id)) {
+        rep.rejected = true;
+        rep.reject_reason = "DUPLICATE_ORDER_ID";
+        rep.reject_message = "Order ID already exists";
         return rep;
     }
 
@@ -131,36 +150,57 @@ ExecutionReport MatchingEngine::handle_new(const NewOrder &no) {
             continue;
         }
 
-        // FIFO is preserved because the front order at the best price is always the
-        // next maker to trade.
-        Order &resting = it_level->second.front();
+        // For STP: temporarily hold orders from same user, restore after matching at this level
+        std::deque<Order> stp_skipped;
 
-        if (no.flags.stp && resting.user_id == no.user_id) {
-            rep.rejected = true;
-            rep.reject_reason = "STP_SELF_TRADE_PREVENTION";
-            rep.reject_message = "Incoming order would trade against same user";
-            return rep;
+        // Process orders at this price level
+        auto &queue = it_level->second;
+        while (!queue.empty() && remaining > 0) {
+            Order &resting = queue.front();
+
+            // STP: skip this resting order but keep it on the book
+            if (no.flags.stp && resting.user_id == no.user_id) {
+                stp_skipped.push_back(resting);
+                queue.pop_front();
+                continue;
+            }
+
+            Quantity traded = std::min(remaining, resting.qty);
+
+            // Execution reports record each maker/taker match independently so callers
+            // can reconstruct how the order was filled.
+            Fill fill;
+            fill.maker_order_id = resting.order_id;
+            fill.maker_user_id = resting.user_id;
+            fill.taker_order_id = no.order_id;
+            fill.taker_user_id = no.user_id;
+            fill.side = no.side;
+            fill.price = resting.price;
+            fill.qty = traded;
+            rep.fills.push_back(fill);
+
+            remaining -= traded;
+            resting.qty -= traded;
+
+            if (resting.qty == 0) {
+                // Remove from id_index_ as well
+                book_.remove_order(resting.order_id);
+            } else {
+                // Partially filled, done with this price level
+                break;
+            }
         }
 
-        Quantity traded = std::min(remaining, resting.qty);
+        // Restore STP-skipped orders to the front of the queue (maintain FIFO)
+        while (!stp_skipped.empty()) {
+            queue.push_front(stp_skipped.back());
+            stp_skipped.pop_back();
+        }
 
-        // Execution reports record each maker/taker match independently so callers
-        // can reconstruct how the order was filled.
-        Fill fill;
-        fill.maker_order_id = resting.order_id;
-        fill.maker_user_id = resting.user_id;
-        fill.taker_order_id = no.order_id;
-        fill.taker_user_id = no.user_id;
-        fill.side = no.side;
-        fill.price = resting.price;
-        fill.qty = traded;
-        rep.fills.push_back(fill);
-
-        remaining -= traded;
-        resting.qty -= traded;
-
-        if (resting.qty == 0) {
-            book_.remove_order(resting.order_id);
+        // Clean up empty price level
+        if (queue.empty()) {
+            levels.erase(it_level);
+            book_.update_best();
         }
     }
 
@@ -247,6 +287,7 @@ ExecutionReport MatchingEngine::handle_modify(const ModifyOrder &mod) {
 }
 
 ExecutionReport MatchingEngine::process(const Command &cmd) {
+    std::lock_guard<std::mutex> lock(mutex_);
     switch (cmd.type) {
     case Command::Type::New:
         return handle_new(cmd.new_order);

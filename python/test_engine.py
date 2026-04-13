@@ -104,6 +104,28 @@ def test_fok_rejects_if_not_fully_fillable():
     assert buy_depth == []
 
 
+def test_duplicate_order_id_rejected():
+    """Duplicate order IDs should be rejected to prevent book corruption."""
+    eng = matching_engine.MatchingEngine()
+
+    # Place first order with ID 1
+    eng.process(new_limit(1, 1, "SELL", 101, 5))
+
+    # Try to place another order with same ID
+    rep = eng.process(new_limit(1, 2, "BUY", 100, 5))
+
+    assert rep["rejected"] is True
+    assert "DUPLICATE" in rep["reject_reason"]
+
+    # Book should remain unchanged - no buy at 100
+    buy_depth = eng.depth("BUY")
+    assert buy_depth == []
+
+    # Original sell should still be there
+    ask_depth = eng.depth("SELL")
+    assert any(lvl["price"] == 101 and lvl["qty"] == 5 for lvl in ask_depth)
+
+
 def test_post_only_rejects_crossing():
     eng = matching_engine.MatchingEngine()
 
@@ -126,20 +148,55 @@ def test_post_only_rejects_crossing():
     assert any(lvl["price"] == 99 and lvl["qty"] == 5 for lvl in buy_depth)
 
 
-def test_stp_rejects_self_trade():
+def test_stp_skips_self_trade():
+    """STP should skip resting orders from same user and continue matching."""
     eng = matching_engine.MatchingEngine()
 
     # Rest a sell from user 1.
     eng.process(new_limit(1, 1, "SELL", 101, 5))
 
-    # Incoming buy from same user with STP should be rejected.
+    # Incoming buy from same user with STP should NOT match, but rest on book.
     rep = eng.process(new_limit(2, 1, "BUY", 101, 5, stp=True))
-    assert rep["rejected"] is True
-    assert "STP" in rep["reject_reason"]
 
-    # Original resting order should remain.
+    # Should not be rejected - STP just skips the self-trade
+    assert rep["rejected"] is False
+
+    # No fills because we skipped the self-trade order
+    assert len(rep["fills"]) == 0
+
+    # Both orders should be on the book
     ask_depth = eng.depth("SELL")
     assert any(lvl["price"] == 101 and lvl["qty"] == 5 for lvl in ask_depth)
+    buy_depth = eng.depth("BUY")
+    assert any(lvl["price"] == 101 and lvl["qty"] == 5 for lvl in buy_depth)
+
+
+def test_stp_matches_other_users():
+    """STP should allow matching against orders from different users."""
+    eng = matching_engine.MatchingEngine()
+
+    # Rest orders from multiple users at same price
+    eng.process(new_limit(1, 1, "SELL", 101, 5))  # User 1's order
+    eng.process(new_limit(2, 2, "SELL", 101, 5))  # User 2's order
+    eng.process(new_limit(3, 3, "SELL", 101, 5))  # User 3's order
+
+    # User 1 buys with STP - should skip their own order, match against user 2
+    rep = eng.process(new_limit(4, 1, "BUY", 101, 7, stp=True))
+
+    assert rep["rejected"] is False
+    assert len(rep["fills"]) == 1
+
+    # Should have matched against user 2's order (FIFO after skipping user 1)
+    assert rep["fills"][0]["maker_order_id"] == 2
+    assert rep["fills"][0]["qty"] == 5
+
+    # Remaining 2 should rest on book
+    buy_depth = eng.depth("BUY")
+    assert any(lvl["price"] == 101 and lvl["qty"] == 2 for lvl in buy_depth)
+
+    # User 1's resting sell should still be there
+    ask_depth = eng.depth("SELL")
+    assert any(lvl["price"] == 101 and lvl["qty"] == 10 for lvl in ask_depth)  # user 1 (5) + user 3 (5)
 
 
 def test_stp_allows_different_users():
